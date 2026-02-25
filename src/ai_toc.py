@@ -9,6 +9,7 @@ import re
 import struct
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from base64 import b64encode
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -18,6 +19,9 @@ from pypdf import PdfReader
 logger = logging.getLogger(__name__)
 DEBUG_LOG_PATH = "/Users/liqingbin/Code/Github/PDFToc/.cursor/debug-08fe99.log"
 DEBUG_SESSION_ID = "08fe99"
+OCR_LOW_CONCURRENCY = 3
+OCR_REQUEST_TIMEOUT = 90
+PNG_FAST_COMPRESSION_LEVEL = 1
 
 
 def _debug_log(
@@ -99,7 +103,8 @@ def extract_toc_text(
     if not os.path.isfile(pdf_path):
         raise FileNotFoundError("PDF file not found: %s" % pdf_path)
 
-    total_pages = _get_pdf_page_count(pdf_path)
+    reader = _open_pdf_reader(pdf_path)
+    total_pages = _get_pdf_page_count(pdf_path, reader=reader)
     page_start_idx, page_end_idx = _resolve_page_range(
         total_pages=total_pages,
         max_pages=max_pages,
@@ -111,6 +116,7 @@ def extract_toc_text(
         pdf_path,
         start_idx=page_start_idx,
         end_idx=page_end_idx,
+        reader=reader,
     )
     candidate_text = selectable_text
     selectable_lines = [line for line in selectable_text.split("\n") if line.strip()]
@@ -133,51 +139,45 @@ def extract_toc_text(
     )
     # endregion
 
-    if (not selectable_usable) or selectable_garbled:
-        logger.info("Selectable text is insufficient, trying OCR fallback.")
-        try:
-            ocr_text = _extract_text_by_ocr(
-                pdf_path,
-                start_idx=page_start_idx,
-                end_idx=page_end_idx,
-            )
-        except OCRExtractionError as exc:
-            logger.warning("OCR fallback failed: %s", exc)
-            # region agent log
-            _debug_log(
-                run_id=run_id,
-                hypothesis_id="H2",
-                location="src/ai_toc.py:extract_toc_text",
-                message="OCR回退失败",
-                data={"error": str(exc)},
-            )
-            # endregion
-            if not selectable_text.strip():
-                raise
-        else:
-            if selectable_garbled:
-                # When direct extraction looks garbled, prefer OCR text.
-                candidate_text = ocr_text
-            else:
-                candidate_text = _merge_sources(selectable_text, ocr_text)
-            ocr_lines = [line for line in ocr_text.split("\n") if line.strip()]
-            merged_lines = [line for line in candidate_text.split("\n") if line.strip()]
-            # region agent log
-            _debug_log(
-                run_id=run_id,
-                hypothesis_id="H2",
-                location="src/ai_toc.py:extract_toc_text",
-                message="OCR回退完成并合并文本",
-                data={
-                    "ocr_char_count": len(ocr_text),
-                    "ocr_line_count": len(ocr_lines),
-                    "ocr_sample_head": ocr_lines[:3],
-                    "merged_char_count": len(candidate_text),
-                    "merged_line_count": len(merged_lines),
-                    "fallback_reason": "garbled" if selectable_garbled else "insufficient",
-                },
-            )
-            # endregion
+    logger.info("Trying OCR extraction by default.")
+    try:
+        ocr_text = _extract_text_by_ocr(
+            pdf_path,
+            start_idx=page_start_idx,
+            end_idx=page_end_idx,
+        )
+    except OCRExtractionError as exc:
+        logger.warning("OCR extraction failed: %s", exc)
+        # region agent log
+        _debug_log(
+            run_id=run_id,
+            hypothesis_id="H2",
+            location="src/ai_toc.py:extract_toc_text",
+            message="OCR默认提取失败，回退可选文本",
+            data={
+                "error": str(exc),
+                "fallback_to_selectable": bool(selectable_text.strip()),
+            },
+        )
+        # endregion
+        if not selectable_text.strip():
+            raise
+    else:
+        candidate_text = ocr_text
+        ocr_lines = [line for line in ocr_text.split("\n") if line.strip()]
+        # region agent log
+        _debug_log(
+            run_id=run_id,
+            hypothesis_id="H2",
+            location="src/ai_toc.py:extract_toc_text",
+            message="OCR默认提取成功并作为候选文本",
+            data={
+                "ocr_char_count": len(ocr_text),
+                "ocr_line_count": len(ocr_lines),
+                "ocr_sample_head": ocr_lines[:3],
+            },
+        )
+        # endregion
 
     if not candidate_text.strip():
         raise PDFTextExtractionError("Cannot extract useful text from the PDF.")
@@ -255,12 +255,12 @@ def normalize_toc_text(text: str) -> str:
     return "\n".join(_deduplicate_keep_order(lines))
 
 
-def _extract_text_from_pdf(pdf_path: str, start_idx: int, end_idx: int) -> str:
+def _extract_text_from_pdf(
+    pdf_path: str, start_idx: int, end_idx: int, reader: Optional[Any] = None
+) -> str:
     """Extract text directly from PDF pages."""
-    try:
-        reader = PdfReader(pdf_path)
-    except Exception as exc:
-        raise PDFTextExtractionError("Failed to open PDF: %s" % exc) from exc
+    if reader is None:
+        reader = _open_pdf_reader(pdf_path)
 
     fragments = []
     for i in range(start_idx, end_idx):
@@ -290,7 +290,7 @@ def _extract_text_by_ocr(pdf_path: str, start_idx: int, end_idx: int) -> str:
     except Exception as exc:
         raise OCRExtractionError("Failed to initialize OCR renderer: %s" % exc) from exc
 
-    lines: List[str] = []
+    rendered_pages: List[Tuple[int, str]] = []
     try:
         for i in range(start_idx, end_idx):
             page = pdf_doc[i]
@@ -298,10 +298,7 @@ def _extract_text_by_ocr(pdf_path: str, start_idx: int, end_idx: int) -> str:
             try:
                 bitmap = page.render(scale=2)
                 image_data_url = _render_bitmap_to_data_url(bitmap)
-                page_text = _request_vision_ocr_text(image_data_url=image_data_url, timeout=90)
-                normalized_page_text = _normalize_vision_ocr_text(page_text)
-                if normalized_page_text:
-                    lines.extend(normalized_page_text.split("\n"))
+                rendered_pages.append((i, image_data_url))
             except Exception as exc:
                 logger.warning("OCR failed on page %s: %s", i, exc)
             finally:
@@ -313,23 +310,61 @@ def _extract_text_by_ocr(pdf_path: str, start_idx: int, end_idx: int) -> str:
         if hasattr(pdf_doc, "close"):
             pdf_doc.close()
 
+    page_text_by_index: Dict[int, str] = {}
+    if rendered_pages:
+        ai_config = _read_ai_config()
+        worker_count = max(1, min(OCR_LOW_CONCURRENCY, len(rendered_pages)))
+        with requests.Session() as session:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_page = {
+                    executor.submit(
+                        _request_vision_ocr_text,
+                        image_data_url=image_data_url,
+                        timeout=OCR_REQUEST_TIMEOUT,
+                        session=session,
+                        ai_config=ai_config,
+                    ): page_idx
+                    for page_idx, image_data_url in rendered_pages
+                }
+                for future in as_completed(future_to_page):
+                    page_idx = future_to_page[future]
+                    try:
+                        page_text = future.result()
+                        normalized_page_text = _normalize_vision_ocr_text(page_text)
+                        if normalized_page_text:
+                            page_text_by_index[page_idx] = normalized_page_text
+                    except Exception as exc:
+                        logger.warning("OCR failed on page %s: %s", page_idx, exc)
+
+    lines: List[str] = []
+    for page_idx, _ in rendered_pages:
+        page_text = page_text_by_index.get(page_idx, "")
+        if page_text:
+            lines.extend(page_text.split("\n"))
+
     text = _compact_multiline_text("\n".join(lines))
     if not text:
         raise OCRExtractionError("OCR produced no readable text.")
     return text
 
 
-def _get_pdf_page_count(pdf_path: str) -> int:
+def _get_pdf_page_count(pdf_path: str, reader: Optional[Any] = None) -> int:
     """Read total page count from PDF."""
-    try:
-        reader = PdfReader(pdf_path)
-    except Exception as exc:
-        raise PDFTextExtractionError("Failed to open PDF: %s" % exc) from exc
+    if reader is None:
+        reader = _open_pdf_reader(pdf_path)
 
     total_pages = len(reader.pages)
     if total_pages <= 0:
         raise PDFTextExtractionError("PDF has no pages.")
     return total_pages
+
+
+def _open_pdf_reader(pdf_path: str) -> Any:
+    """Open PDF reader with unified error translation."""
+    try:
+        return PdfReader(pdf_path)
+    except Exception as exc:
+        raise PDFTextExtractionError("Failed to open PDF: %s" % exc) from exc
 
 
 def _resolve_page_range(
@@ -606,7 +641,7 @@ def _encode_image_bytes_to_png_bytes(
 
     color_type = 2 if channels == 3 else 6
     ihdr = struct.pack("!IIBBBBB", width, height, 8, color_type, 0, 0, 0)
-    compressed = zlib.compress(bytes(raw_scanlines), level=9)
+    compressed = zlib.compress(bytes(raw_scanlines), level=PNG_FAST_COMPRESSION_LEVEL)
 
     return (
         b"\x89PNG\r\n\x1a\n"
@@ -653,18 +688,22 @@ def _build_vision_ocr_payload(image_data_url: str, model: str) -> Dict[str, Any]
 
 
 def _request_vision_ocr_text(
-    image_data_url: str, timeout: int
+    image_data_url: str,
+    timeout: int,
+    session: Optional[requests.Session] = None,
+    ai_config: Optional[Tuple[str, str, str]] = None,
 ) -> str:
     """Send one image to OpenAI-compatible multimodal endpoint and return OCR text."""
-    endpoint, api_key, model = _read_ai_config()
+    endpoint, api_key, model = ai_config if ai_config is not None else _read_ai_config()
     payload = _build_vision_ocr_payload(image_data_url=image_data_url, model=model)
     headers = {
         "Authorization": "Bearer %s" % api_key,
         "Content-Type": "application/json",
     }
+    requester = session if session is not None else requests
 
     try:
-        response = requests.post(
+        response = requester.post(
             endpoint, headers=headers, json=payload, timeout=timeout
         )
     except requests.RequestException as exc:
