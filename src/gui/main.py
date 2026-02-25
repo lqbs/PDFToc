@@ -6,6 +6,7 @@ The main GUI model of project.
 """
 
 import os
+import inspect
 import sys
 import traceback
 import webbrowser
@@ -37,6 +38,43 @@ class ControlButtonMixin(object):
         exit_button.clicked.connect(self.close)
 
 
+class AiExtractWorker(QtCore.QObject):
+    succeeded = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+    done = QtCore.pyqtSignal()
+
+    def __init__(self, pdf_path, start_page=1, end_page=20):
+        super().__init__()
+        self.pdf_path = pdf_path
+        self.start_page = start_page
+        self.end_page = end_page
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            try:
+                from src.ai_toc import extract_toc_text
+            except ImportError:
+                raise RuntimeError("AI目录功能不可用，请确认 src/ai_toc.py 已正确接入。")
+            except Exception as e:
+                raise RuntimeError("AI目录模块初始化失败：%s" % (str(e).strip() or "未知错误"))
+
+            extract_params = inspect.signature(extract_toc_text).parameters
+            if "start_page" in extract_params and "end_page" in extract_params:
+                toc_text = extract_toc_text(
+                    self.pdf_path, start_page=self.start_page, end_page=self.end_page
+                )
+            else:
+                toc_text = extract_toc_text(self.pdf_path)
+            if not isinstance(toc_text, str) or not toc_text.strip():
+                raise ValueError("模型响应为空，请检查 API 配置或重试。")
+            self.succeeded.emit(toc_text.strip())
+        except Exception as e:
+            self.failed.emit(str(e).strip() or "未知错误")
+        finally:
+            self.done.emit()
+
+
 class Main(QtWidgets.QMainWindow, Ui_PDFdir, ControlButtonMixin):
     def __init__(self, app, trans):
         super(Main, self).__init__()
@@ -60,10 +98,13 @@ class Main(QtWidgets.QMainWindow, Ui_PDFdir, ControlButtonMixin):
         self._set_action()
         self._set_unwritable()
         self._worker = None
+        self._worker_thread = None
 
     def _set_connect(self):
         self.open_button.clicked.connect(self.open_file_dialog)
         self.export_button.clicked.connect(self.write_tree_to_pdf)
+        if hasattr(self, "ai_extract_button"):
+            self.ai_extract_button.clicked.connect(self.extract_dir_text_by_ai)
         self.level0_box.clicked.connect(self._change_level0_writable)
         self.level1_box.clicked.connect(self._change_level1_writable)
         self.level2_box.clicked.connect(self._change_level2_writable)
@@ -318,6 +359,91 @@ class Main(QtWidgets.QMainWindow, Ui_PDFdir, ControlButtonMixin):
             self.alert_msg("%s Finished！" % new_path)
         except PermissionError:
             self.alert_msg("Permission denied！", level="warn")
+
+    def extract_dir_text_by_ai(self):
+        pdf_path = (self.pdf_path or "").strip()
+        if not pdf_path:
+            self.alert_msg("请先选择PDF文件。", level="warn")
+            return
+        if not os.path.isfile(pdf_path):
+            self.alert_msg("PDF文件不存在，请重新选择。", level="warn")
+            return
+        start_page_raw = self._get_ai_start_page_raw()
+        end_page_raw = self._get_ai_end_page_raw()
+        if not start_page_raw or not end_page_raw:
+            self.alert_msg("目录页开始/结束页不能为空。", level="warn")
+            return
+        if not start_page_raw.isdigit() or not end_page_raw.isdigit():
+            self.alert_msg("目录页开始/结束页必须是正整数。", level="warn")
+            return
+        start_page = int(start_page_raw)
+        end_page = int(end_page_raw)
+        if start_page <= 0 or end_page <= 0:
+            self.alert_msg("目录页开始/结束页必须大于0。", level="warn")
+            return
+        if start_page > end_page:
+            self.alert_msg("目录页开始页不能大于结束页。", level="warn")
+            return
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            self.show_status("正在处理，请稍候...", 3000)
+            return
+
+        self.show_status("正在自动获取目录文本，请稍候...", 5000)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        if hasattr(self, "ai_extract_button"):
+            self.ai_extract_button.setEnabled(False)
+        self._worker_thread = QtCore.QThread(self)
+        self._worker = AiExtractWorker(
+            pdf_path, start_page=start_page, end_page=end_page
+        )
+        self._worker.moveToThread(self._worker_thread)
+
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.succeeded.connect(self._on_ai_extract_succeeded)
+        self._worker.failed.connect(self._on_ai_extract_failed)
+        self._worker.done.connect(self._on_ai_extract_done)
+        self._worker.done.connect(self._worker_thread.quit)
+        self._worker_thread.finished.connect(self._worker.deleteLater)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.finished.connect(self._clear_ai_extract_worker)
+        self._worker_thread.start()
+
+    def _on_ai_extract_succeeded(self, toc_text):
+        self.dir_text_edit.setPlainText(toc_text)
+        self.show_status("目录文本已自动填充。", 5000)
+
+    def _on_ai_extract_failed(self, err_msg):
+        self.show_status("自动获取目录失败。", 5000)
+        self.alert_msg("自动获取目录失败：%s" % err_msg, level="warn")
+
+    def _on_ai_extract_done(self):
+        if QtWidgets.QApplication.overrideCursor() is not None:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _clear_ai_extract_worker(self):
+        if hasattr(self, "ai_extract_button"):
+            self.ai_extract_button.setEnabled(True)
+        self._worker = None
+        self._worker_thread = None
+
+    def _get_ai_start_page_raw(self):
+        for attr_name in ("ai_page_start_edit", "ai_start_page_edit"):
+            if hasattr(self, attr_name):
+                return getattr(self, attr_name).text().strip()
+        return "1"
+
+    def _get_ai_end_page_raw(self):
+        for attr_name in ("ai_page_end_edit", "ai_end_page_edit"):
+            if hasattr(self, attr_name):
+                return getattr(self, attr_name).text().strip()
+        return "20"
+
+    def closeEvent(self, event):
+        if self._worker_thread is not None and self._worker_thread.isRunning():
+            self.alert_msg("正在自动获取目录文本，请稍候完成后再关闭。", level="warn")
+            event.ignore()
+            return
+        super(Main, self).closeEvent(event)
 
     @staticmethod
     def dict_to_pdf(pdf_path, index_dict, keep_exist_dir=False):

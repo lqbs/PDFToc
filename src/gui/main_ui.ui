@@ -80,6 +80,63 @@
                             </widget>
                         </item>
                         <item>
+                            <layout class="QHBoxLayout" name="ai_extract_layout">
+                                <item>
+                                    <widget class="QPushButton" name="ai_extract_button">
+                                        <property name="text">
+                                            <string>AI获取目录</string>
+                                        </property>
+                                    </widget>
+                                </item>
+                                <item>
+                                    <widget class="QLabel" name="ai_start_page_label">
+                                        <property name="text">
+                                            <string>开始页</string>
+                                        </property>
+                                    </widget>
+                                </item>
+                                <item>
+                                    <widget class="QLineEdit" name="ai_start_page_edit">
+                                        <property name="maximumSize">
+                                            <size>
+                                                <width>50</width>
+                                                <height>16777215</height>
+                                            </size>
+                                        </property>
+                                        <property name="inputMethodHints">
+                                            <set>Qt::ImhDigitsOnly</set>
+                                        </property>
+                                        <property name="text">
+                                            <string>1</string>
+                                        </property>
+                                    </widget>
+                                </item>
+                                <item>
+                                    <widget class="QLabel" name="ai_end_page_label">
+                                        <property name="text">
+                                            <string>结束页</string>
+                                        </property>
+                                    </widget>
+                                </item>
+                                <item>
+                                    <widget class="QLineEdit" name="ai_end_page_edit">
+                                        <property name="maximumSize">
+                                            <size>
+                                                <width>50</width>
+                                                <height>16777215</height>
+                                            </size>
+                                        </property>
+                                        <property name="inputMethodHints">
+                                            <set>Qt::ImhDigitsOnly</set>
+                                        </property>
+                                        <property name="text">
+                                            <string>20</string>
+                                        </property>
+                                    </widget>
+                                </item>
+                            </layout>
+                        </item>
+                        <item>
                             <widget class="QTextEdit" name="dir_text_edit">
                                 <property name="font">
                                     <font>
